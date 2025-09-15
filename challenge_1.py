@@ -59,17 +59,21 @@ import copy
 from joblib import Parallel, delayed
 
 # Identify whether a CUDA-enabled GPU is available
-device = "cuda" if torch.cuda.is_available() else "cpu"
-if device == "cuda":
-    msg = 'CUDA-enabled GPU found. Training should be faster.'
+if torch.cuda.is_available():
+    device = "cuda"
+    msg = "CUDA-enabled GPU found. Training should be faster."
+elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+    device = "mps"
+    msg = "Apple Silicon GPU (MPS) available. Training will use Metal backend."
 else:
+    device = "cpu"
     msg = (
-        "No GPU found. Training will be carried out on CPU, which might be "
-        "slower.\n\nIf running on Google Colab, you can request a GPU runtime by"
-        " clicking\n`Runtime/Change runtime type` in the top bar menu, then "
-        "selecting 'T4 GPU'\nunder 'Hardware accelerator'."
+        "No GPU found. Training will be carried out on CPU, which might be slower.\n\n"
+        "On Mac with Apple Silicon, ensure you have PyTorch >= 1.12 installed with MPS support.\n"
+        "See: https://pytorch.org for install instructions."
     )
 print(msg)
+
 
 # %% [markdown]
 # ## 1. What are we decoding?
@@ -247,6 +251,12 @@ def train_one_epoch(
     device,
     print_batch_stats: bool = True,
 ):
+    # Make sure model is on the correct device and dtype
+    if device == "mps":
+        model = model.to(device, dtype=torch.float32)
+    else:
+        model = model.to(device)
+
     model.train()
 
     total_loss = 0.0
@@ -260,11 +270,19 @@ def train_one_epoch(
     for batch_idx, batch in progress_bar:
         # Support datasets that may return (X, y) or (X, y, ...)
         X, y = batch[0], batch[1]
-        X, y = X.to(device).float(), y.to(device).float()
+        if device == "mps":
+            X, y = X.to(device, dtype=torch.float32), y.to(device, dtype=torch.float32)
+        else:
+            X, y = X.to(device), y.to(device)
 
         optimizer.zero_grad(set_to_none=True)
         preds = model(X)
+
+        # Keep loss consistent in float32 on MPS
         loss = loss_fn(preds, y)
+        if device == "mps":
+            loss = loss.to(torch.float32)
+
         loss.backward()
         optimizer.step()
 
@@ -300,6 +318,10 @@ def valid_model(
 ):
     model.eval()
 
+    # Make sure model weights are float32 if running on MPS
+    if device == "mps":
+        model = model.to(torch.float32)
+
     total_loss = 0.0
     sum_sq_err = 0.0
     n_batches = len(dataloader)
@@ -314,10 +336,12 @@ def valid_model(
     for batch_idx, batch in iterator:
         # Supports (X, y) or (X, y, ...)
         X, y = batch[0], batch[1]
-        X, y = X.to(device).float(), y.to(device).float()
+        X, y = X.to(device, dtype=torch.float32), y.to(device, dtype=torch.float32)
 
         preds = model(X)
-        batch_loss = loss_fn(preds, y).item()
+
+        # Ensure loss_fn also works in float32
+        batch_loss = loss_fn(preds, y).float().item()
         total_loss += batch_loss
 
         preds_flat = preds.detach().view(-1)
